@@ -11,17 +11,16 @@ import os
 import xml.etree.ElementTree as ET
 import math
 
-# Disable PIL decompression bomb protection for large images
 Image.MAX_IMAGE_PIXELS = None
 
 app = typer.Typer()
-
-collection_list_endpoint = "https://collections.mun.ca/digital/bl/dmwebservices/index.php?q=dmGetCollectionList/json"
 
 
 @app.command()
 def collections():
     """List all collections from the MUN Digital Archive."""
+    collection_list_endpoint = "https://collections.mun.ca/digital/bl/dmwebservices/index.php?q=dmGetCollectionList/json"
+
     try:
         response = httpx.get(collection_list_endpoint, verify=False)
         response.raise_for_status()
@@ -162,6 +161,7 @@ def download_image(url: str, filepath: Path, max_retries: int = 3) -> bool:
                 return False
 
         except Exception as e:
+            print(f"Error downloading image {url}: {e}")
             if attempt < max_retries - 1:
                 time.sleep(1.0 * (attempt + 1))
                 continue
@@ -736,8 +736,10 @@ def combine_strips(strips_dir: Path, out_dir: Path, max_height: int = 20000):
                 with Image.open(strips_dir / f) as img:
                     yield img.copy()
 
-    strip_files = [f for f in sorted(os.listdir(strips_dir)) if f.lower().endswith(".jpg")]
-    
+    strip_files = [
+        f for f in sorted(os.listdir(strips_dir)) if f.lower().endswith(".jpg")
+    ]
+
     if not strip_files:
         typer.echo("❌ No strips found")
         return
@@ -831,7 +833,9 @@ def tile_image(img_path: Path, out_dir: Path, tile_size=256, overlap=1, fmt="jpg
 @app.command()
 def make_collection(
     canvases_dir: Path = typer.Argument(..., help="Directory of combined canvases"),
-    out_dir: Path = typer.Argument(..., help="Output dir for DeepZoom tiles + collection"),
+    out_dir: Path = typer.Argument(
+        ..., help="Output dir for DeepZoom tiles + collection"
+    ),
     tile_size: int = typer.Option(256, help="Tile size (default 256)"),
     overlap: int = typer.Option(1, help="Tile overlap (default 1)"),
     fmt: str = typer.Option("jpg", help="Tile format (jpg or png)"),
@@ -842,17 +846,27 @@ def make_collection(
     out_dir.mkdir(parents=True, exist_ok=True)
     items_el = ET.Element("Items")
 
-    files = sorted([f for f in canvases_dir.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png")])
+    files = sorted(
+        [
+            f
+            for f in canvases_dir.iterdir()
+            if f.suffix.lower() in (".jpg", ".jpeg", ".png")
+        ]
+    )
     typer.echo(f"Found {len(files)} canvases")
 
     for idx, f in enumerate(files):
         w, h, dzi_path = tile_image(f, out_dir, tile_size, overlap, fmt)
 
-        item_el = ET.SubElement(items_el, "I", {
-            "Id": str(idx),
-            "N": f.stem,
-            "Source": dzi_path.name,
-        })
+        item_el = ET.SubElement(
+            items_el,
+            "I",
+            {
+                "Id": str(idx),
+                "N": f.stem,
+                "Source": dzi_path.name,
+            },
+        )
         ET.SubElement(item_el, "Size", {"Width": str(w), "Height": str(h)})
 
         typer.echo(f"✅ Tiled {f} -> {dzi_path}")
@@ -860,7 +874,17 @@ def make_collection(
     collection_el = ET.Element(
         "Collection",
         {
-            "MaxLevel": str(int(math.log(max(max(w, h) for w, h, _ in [tile_image(f, out_dir) for f in files]), 2))),
+            "MaxLevel": str(
+                int(
+                    math.log(
+                        max(
+                            max(w, h)
+                            for w, h, _ in [tile_image(f, out_dir) for f in files]
+                        ),
+                        2,
+                    )
+                )
+            ),
             "TileSize": str(tile_size),
             "Format": fmt,
             "NextItemId": str(len(files)),
@@ -890,44 +914,50 @@ def make_single_dzi(
     Combine all canvases into one massive image and tile into a single DeepZoom (.dzi + tiles).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    
-    files = sorted([f for f in canvases_dir.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png")])
+
+    files = sorted(
+        [
+            f
+            for f in canvases_dir.iterdir()
+            if f.suffix.lower() in (".jpg", ".jpeg", ".png")
+        ]
+    )
     if not files:
         typer.echo("❌ No canvas files found")
         return
-    
+
     typer.echo(f"Found {len(files)} canvases to combine")
-    
+
     # First pass to get dimensions
     typer.echo("📏 Measuring canvases...")
     canvas_w = 0
     total_height = 0
-    
+
     for f in files:
         with Image.open(f) as img:
             canvas_w = max(canvas_w, img.width)
             total_height += img.height
-    
+
     typer.echo(f"Combined dimensions will be: {canvas_w}x{total_height}")
-    
+
     # Create the massive combined image
     typer.echo("🖼️  Creating massive combined image...")
     combined = Image.new("RGB", (canvas_w, total_height), (255, 255, 255))
-    
+
     current_y = 0
     for f in files:
         typer.echo(f"  Adding {f.name}...")
         with Image.open(f) as img:
             combined.paste(img, (0, current_y))
             current_y += img.height
-    
+
     typer.echo("🔧 Tiling massive image into DeepZoom format...")
-    
+
     # Calculate levels for the massive image
     w, h = combined.size
     max_dim = max(w, h)
     levels = int(math.ceil(math.log(max_dim, 2))) + 1
-    
+
     # Create DZI file
     dzi_path = out_dir / "combined.dzi"
     dzi_xml = f"""<Image TileSize="{tile_size}" Overlap="{overlap}" Format="{fmt}"
@@ -935,27 +965,27 @@ def make_single_dzi(
   <Size Width="{w}" Height="{h}" />
 </Image>"""
     dzi_path.write_text(dzi_xml)
-    
+
     typer.echo(f"📄 Created DZI metadata: {dzi_path}")
     typer.echo(f"🎯 Will create {levels} zoom levels")
-    
+
     # Generate tiles for each level
     for level in range(levels):
         scale = 2 ** (levels - level - 1)
         level_w = int(math.ceil(w / scale))
         level_h = int(math.ceil(h / scale))
-        
+
         typer.echo(f"⚙️  Processing level {level}: {level_w}x{level_h}")
         level_img = combined.resize((level_w, level_h), Image.LANCZOS)
-        
+
         cols = math.ceil(level_w / tile_size)
         rows = math.ceil(level_h / tile_size)
         level_dir = out_dir / "combined" / str(level)
         level_dir.mkdir(parents=True, exist_ok=True)
-        
+
         tile_count = 0
         total_tiles = cols * rows
-        
+
         for col in range(cols):
             for row in range(rows):
                 box = (
@@ -967,11 +997,11 @@ def make_single_dzi(
                 tile = level_img.crop(box)
                 tile.save(level_dir / f"{col}_{row}.{fmt}", quality=90)
                 tile_count += 1
-                
+
                 # Progress indicator for large levels
                 if tile_count % 100 == 0 or tile_count == total_tiles:
                     typer.echo(f"    Created {tile_count}/{total_tiles} tiles")
-    
+
     typer.echo(f"✅ Single DZI created: {dzi_path}")
     typer.echo(f"📁 Tiles saved in: {out_dir / 'combined'}")
     typer.echo(f"🎉 Final image size: {w}x{h} pixels")
