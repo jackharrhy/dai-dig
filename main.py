@@ -676,68 +676,146 @@ def download_images(
     typer.echo(f"Images saved to: {base_path.absolute()}")
 
 
-def make_issue_strip(issue_dir: Path, out_dir: Path) -> Path | None:
-    imgs = []
-    for f in sorted(os.listdir(issue_dir)):
-        if f.lower().endswith((".jpg", ".jpeg", ".png")):
-            try:
-                img = Image.open(issue_dir / f)
-                imgs.append(img)
-            except Exception:
-                print(f"❌ {f} failed to open as image, skipping")
-                continue
-    if not imgs:
+def make_year_strip(year_dir: Path, out_dir: Path) -> Path | None:
+    """Create a horizontal strip for an entire year by combining all images from all issues."""
+
+    # First pass: collect all image file paths and get max height
+    image_paths = []
+    issue_count = 0
+
+    print(f"  Scanning year {year_dir.name} for images...")
+
+    # Walk through all subdirectories (issues) in the year directory
+    for issue_dir in sorted(year_dir.iterdir()):
+        if issue_dir.is_dir():
+            issue_count += 1
+            # Get all image file paths from this issue, sorted by filename
+            for f in sorted(os.listdir(issue_dir)):
+                if f.lower().endswith((".jpg", ".jpeg", ".png")):
+                    image_paths.append(issue_dir / f)
+
+            if issue_count % 10 == 0:
+                print(
+                    f"    Scanned {issue_count} issues, {len(image_paths)} total images so far..."
+                )
+
+    if not image_paths:
+        print(f"❌ No images found in year directory {year_dir}")
         return None
 
-    max_h = max(img.height for img in imgs)
-    resized = []
-    for img in imgs:
-        scale = max_h / img.height
-        resized.append(img.resize((int(img.width * scale), max_h)))
+    print(f"  Found {len(image_paths)} total images across {issue_count} issues")
 
-    total_w = sum(i.width for i in resized)
+    # Second pass: find maximum height without keeping images open
+    print(f"  Finding maximum height...")
+    max_h = 0
+    for i, img_path in enumerate(image_paths):
+        try:
+            with Image.open(img_path) as img:
+                max_h = max(max_h, img.height)
+        except Exception:
+            print(f"❌ {img_path} failed to open as image, skipping")
+            continue
+
+        if (i + 1) % 100 == 0:
+            print(f"    Measured {i + 1}/{len(image_paths)} images...")
+
+    print(f"  Maximum height: {max_h}px")
+
+    # Third pass: calculate total width needed
+    print(f"  Calculating total width...")
+    total_w = 0
+    valid_paths = []
+    for i, img_path in enumerate(image_paths):
+        try:
+            with Image.open(img_path) as img:
+                scale = max_h / img.height
+                scaled_width = int(img.width * scale)
+                total_w += scaled_width
+                valid_paths.append(img_path)
+        except Exception:
+            print(f"❌ {img_path} failed to open as image, skipping")
+            continue
+
+        if (i + 1) % 100 == 0:
+            print(f"    Calculated dimensions for {i + 1}/{len(image_paths)} images...")
+
+    print(f"  Final strip dimensions: {total_w}x{max_h}px")
+    print(f"  Creating strip with {len(valid_paths)} valid images...")
+
+    # Create the strip canvas
     strip = Image.new("RGB", (total_w, max_h), (255, 255, 255))
 
+    # Fourth pass: paste images one by one using generator approach
+    def image_generator():
+        for img_path in valid_paths:
+            try:
+                with Image.open(img_path) as img:
+                    scale = max_h / img.height
+                    scaled_img = img.resize(
+                        (int(img.width * scale), max_h), Image.LANCZOS
+                    )
+                    yield scaled_img.copy()
+            except Exception:
+                print(f"❌ {img_path} failed to process, skipping")
+                continue
+
+    # Paste all images horizontally
     x = 0
-    for img in resized:
+    for i, img in enumerate(image_generator()):
         strip.paste(img, (x, 0))
         x += img.width
 
+        if (i + 1) % 50 == 0:
+            print(f"    Pasted {i + 1}/{len(valid_paths)} images...")
+
+    # Save the year strip as PNG to avoid JPEG size limits
     out_dir.mkdir(parents=True, exist_ok=True)
-    name = issue_dir.name + "_strip.jpg"
+    name = f"{year_dir.name}_year_strip.png"
     out_path = out_dir / name
-    strip.save(out_path, quality=90)
+    strip.save(out_path, format="PNG")
+
+    print(f"✅ Year strip saved: {out_path}")
     return out_path
 
 
 @app.command()
 def make_strips(
     base_dir: Path = typer.Argument(..., help="Root images directory (e.g. ./images)"),
-    out_dir: Path = typer.Argument(..., help="Output dir for strips (e.g. ./strips)"),
+    out_dir: Path = typer.Argument(
+        ..., help="Output dir for year strips (e.g. ./strips)"
+    ),
 ):
     """
-    Walk through BASE_DIR and generate per-issue horizontal strips in OUT_DIR.
+    Walk through BASE_DIR and generate per-year horizontal strips in OUT_DIR.
+    Each year directory should contain issue subdirectories with images.
     """
     count = 0
-    for root, dirs, files in os.walk(base_dir):
-        if any(f.lower().endswith((".jpg", ".jpeg", ".png")) for f in files):
-            issue_dir = Path(root)
-            out_path = make_issue_strip(issue_dir, out_dir)
+
+    # Look for year directories (should be direct subdirectories of base_dir)
+    for year_dir in sorted(base_dir.iterdir()):
+        if year_dir.is_dir() and year_dir.name.isdigit():
+            typer.echo(f"🗓️  Processing year {year_dir.name}...")
+            out_path = make_year_strip(year_dir, out_dir)
             if out_path:
-                typer.echo(f"✅ {issue_dir} -> {out_path}")
+                typer.echo(f"✅ {year_dir} -> {out_path}")
                 count += 1
-    typer.echo(f"Done. Generated {count} strips.")
+            else:
+                typer.echo(f"⚠️  No images found in {year_dir}")
+
+    typer.echo(f"Done. Generated {count} year strips.")
 
 
 def combine_strips(strips_dir: Path, out_dir: Path, max_height: int = 20000):
     def strip_generator():
         for f in sorted(os.listdir(strips_dir)):
-            if f.lower().endswith(".jpg"):
+            if f.lower().endswith((".jpg", ".png")):
                 with Image.open(strips_dir / f) as img:
                     yield img.copy()
 
     strip_files = [
-        f for f in sorted(os.listdir(strips_dir)) if f.lower().endswith(".jpg")
+        f
+        for f in sorted(os.listdir(strips_dir))
+        if f.lower().endswith((".jpg", ".png"))
     ]
 
     if not strip_files:
