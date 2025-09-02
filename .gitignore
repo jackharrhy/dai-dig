@@ -12,3 +12,9 @@ wheels/
 *.db
 
 images/
+*.swp
+
+strips
+combined
+deepzoom-output
+deepzoom-single-output

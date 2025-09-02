@@ -5,7 +5,14 @@ import sqlite3
 import time
 from typing import Optional
 from pathlib import Path
+from PIL import Image
 import re
+import os
+import xml.etree.ElementTree as ET
+import math
+
+# Disable PIL decompression bomb protection for large images
+Image.MAX_IMAGE_PIXELS = None
 
 app = typer.Typer()
 
@@ -115,6 +122,23 @@ def create_safe_filename(title: str, page_number: int) -> str:
 
     # Format with leading zero for proper sorting
     return f"{page_number:02d}_{clean_title}"
+
+
+def create_safe_folder_name(title: str, date: str) -> str:
+    """Create a safe folder name from title and date, removing problematic characters."""
+    # Clean the title for filesystem - remove brackets, slashes, question marks, etc.
+    safe_title = re.sub(r"[^\w\s-]", "", title)
+    safe_title = re.sub(r"[-\s]+", "_", safe_title).strip("_")
+
+    # Clean the date as well - remove brackets, slashes, question marks, etc.
+    safe_date = re.sub(r"[^\w\s-]", "", date) if date else ""
+    safe_date = re.sub(r"[-\s]+", "_", safe_date).strip("_")
+
+    # Combine date and title
+    if safe_date:
+        return f"{safe_date}_{safe_title}"
+    else:
+        return safe_title
 
 
 def download_image(url: str, filepath: Path, max_retries: int = 3) -> bool:
@@ -234,10 +258,8 @@ def init_download_progress(year_filter: Optional[int] = None):
 
     # Create download progress entries for new pages
     for title, date, year, page_id, page_title, page_number in pages:
-        # Create file path structure
-        safe_title = re.sub(r"[^\w\s-]", "", title)
-        safe_title = re.sub(r"[-\s]+", "_", safe_title).strip("_")
-        folder_name = f"{date}_{safe_title}"
+        # Create file path structure using safe folder name function
+        folder_name = create_safe_folder_name(title, date)
         filename = create_safe_filename(page_title, page_number)
         file_path = f"{year}/{folder_name}/{filename}.jpg"
 
@@ -614,12 +636,11 @@ def download_images(
             if download_image(image_url, image_path):
                 downloaded += 1
                 mark_download_complete(page_id)
-                if downloaded % 10 == 0:
-                    typer.echo(f"  Downloaded {downloaded}/{total_pages} images...")
+                typer.echo(f"  ✓ Downloaded {page_title} ({downloaded}/{total_pages})")
             else:
                 failed += 1
                 mark_download_failed(page_id)
-                typer.echo(f"  Failed to download {page_id} ({page_title})")
+                typer.echo(f"  ✗ Failed to download {page_id} ({page_title})")
 
             # Small delay to be respectful
             time.sleep(0.1)
@@ -653,6 +674,307 @@ def download_images(
     typer.echo(f"Total failed: {total_failed}")
     typer.echo(f"Total pending: {total_pending}")
     typer.echo(f"Images saved to: {base_path.absolute()}")
+
+
+def make_issue_strip(issue_dir: Path, out_dir: Path) -> Path | None:
+    imgs = []
+    for f in sorted(os.listdir(issue_dir)):
+        if f.lower().endswith((".jpg", ".jpeg", ".png")):
+            try:
+                img = Image.open(issue_dir / f)
+                imgs.append(img)
+            except Exception:
+                print(f"❌ {f} failed to open as image, skipping")
+                continue
+    if not imgs:
+        return None
+
+    max_h = max(img.height for img in imgs)
+    resized = []
+    for img in imgs:
+        scale = max_h / img.height
+        resized.append(img.resize((int(img.width * scale), max_h)))
+
+    total_w = sum(i.width for i in resized)
+    strip = Image.new("RGB", (total_w, max_h), (255, 255, 255))
+
+    x = 0
+    for img in resized:
+        strip.paste(img, (x, 0))
+        x += img.width
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = issue_dir.name + "_strip.jpg"
+    out_path = out_dir / name
+    strip.save(out_path, quality=90)
+    return out_path
+
+
+@app.command()
+def make_strips(
+    base_dir: Path = typer.Argument(..., help="Root images directory (e.g. ./images)"),
+    out_dir: Path = typer.Argument(..., help="Output dir for strips (e.g. ./strips)"),
+):
+    """
+    Walk through BASE_DIR and generate per-issue horizontal strips in OUT_DIR.
+    """
+    count = 0
+    for root, dirs, files in os.walk(base_dir):
+        if any(f.lower().endswith((".jpg", ".jpeg", ".png")) for f in files):
+            issue_dir = Path(root)
+            out_path = make_issue_strip(issue_dir, out_dir)
+            if out_path:
+                typer.echo(f"✅ {issue_dir} -> {out_path}")
+                count += 1
+    typer.echo(f"Done. Generated {count} strips.")
+
+
+def combine_strips(strips_dir: Path, out_dir: Path, max_height: int = 20000):
+    def strip_generator():
+        for f in sorted(os.listdir(strips_dir)):
+            if f.lower().endswith(".jpg"):
+                with Image.open(strips_dir / f) as img:
+                    yield img.copy()
+
+    strip_files = [f for f in sorted(os.listdir(strips_dir)) if f.lower().endswith(".jpg")]
+    
+    if not strip_files:
+        typer.echo("❌ No strips found")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # First pass to get max width
+    canvas_w = 0
+    for f in strip_files:
+        with Image.open(strips_dir / f) as img:
+            canvas_w = max(canvas_w, img.width)
+
+    cur_h = 0
+    idx = 0
+    canvas = Image.new("RGB", (canvas_w, max_height), (255, 255, 255))
+
+    for strip in strip_generator():
+        if cur_h + strip.height > max_height:
+            # save current page
+            out_path = out_dir / f"page_{idx:04d}.jpg"
+            canvas.crop((0, 0, canvas_w, cur_h)).save(out_path, quality=90)
+            typer.echo(f"🖼️  Saved {out_path}")
+            idx += 1
+            canvas = Image.new("RGB", (canvas_w, max_height), (255, 255, 255))
+            cur_h = 0
+
+        canvas.paste(strip, (0, cur_h))
+        cur_h += strip.height
+
+    if cur_h > 0:
+        out_path = out_dir / f"page_{idx:04d}.jpg"
+        canvas.crop((0, 0, canvas_w, cur_h)).save(out_path, quality=90)
+        typer.echo(f"🖼️  Saved {out_path}")
+
+
+@app.command()
+def combine(
+    strips_dir: Path = typer.Argument(..., help="Directory of issue strips"),
+    out_dir: Path = typer.Argument(..., help="Output dir for combined pages"),
+    max_height: int = typer.Option(20000, help="Max height of each combined page"),
+):
+    """
+    Combine issue strips vertically into page-sized canvases.
+    """
+    combine_strips(strips_dir, out_dir, max_height)
+
+
+def tile_image(img_path: Path, out_dir: Path, tile_size=256, overlap=1, fmt="jpg"):
+    """
+    Tile one image into DeepZoom format (.dzi + tiles).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with Image.open(img_path) as img:
+        w, h = img.size
+        max_dim = max(w, h)
+        levels = int(math.ceil(math.log(max_dim, 2))) + 1
+
+        dzi_path = out_dir / f"{img_path.stem}.dzi"
+        dzi_xml = f"""<Image TileSize="{tile_size}" Overlap="{overlap}" Format="{fmt}"
+    xmlns="http://schemas.microsoft.com/deepzoom/2008">
+  <Size Width="{w}" Height="{h}" />
+</Image>"""
+        dzi_path.write_text(dzi_xml)
+
+        # make tiles per level
+        for level in range(levels):
+            scale = 2 ** (levels - level - 1)
+            level_w = int(math.ceil(w / scale))
+            level_h = int(math.ceil(h / scale))
+            level_img = img.resize((level_w, level_h), Image.LANCZOS)
+
+            cols = math.ceil(level_w / tile_size)
+            rows = math.ceil(level_h / tile_size)
+            level_dir = out_dir / img_path.stem / str(level)
+            level_dir.mkdir(parents=True, exist_ok=True)
+
+            for col in range(cols):
+                for row in range(rows):
+                    box = (
+                        col * tile_size,
+                        row * tile_size,
+                        min((col + 1) * tile_size, level_w),
+                        min((row + 1) * tile_size, level_h),
+                    )
+                    tile = level_img.crop(box)
+                    tile.save(level_dir / f"{col}_{row}.{fmt}", quality=90)
+
+    return w, h, dzi_path
+
+
+@app.command()
+def make_collection(
+    canvases_dir: Path = typer.Argument(..., help="Directory of combined canvases"),
+    out_dir: Path = typer.Argument(..., help="Output dir for DeepZoom tiles + collection"),
+    tile_size: int = typer.Option(256, help="Tile size (default 256)"),
+    overlap: int = typer.Option(1, help="Tile overlap (default 1)"),
+    fmt: str = typer.Option("jpg", help="Tile format (jpg or png)"),
+):
+    """
+    Tile each canvas into DeepZoom (.dzi + tiles) and build a DeepZoom Collection (DZC).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    items_el = ET.Element("Items")
+
+    files = sorted([f for f in canvases_dir.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png")])
+    typer.echo(f"Found {len(files)} canvases")
+
+    for idx, f in enumerate(files):
+        w, h, dzi_path = tile_image(f, out_dir, tile_size, overlap, fmt)
+
+        item_el = ET.SubElement(items_el, "I", {
+            "Id": str(idx),
+            "N": f.stem,
+            "Source": dzi_path.name,
+        })
+        ET.SubElement(item_el, "Size", {"Width": str(w), "Height": str(h)})
+
+        typer.echo(f"✅ Tiled {f} -> {dzi_path}")
+
+    collection_el = ET.Element(
+        "Collection",
+        {
+            "MaxLevel": str(int(math.log(max(max(w, h) for w, h, _ in [tile_image(f, out_dir) for f in files]), 2))),
+            "TileSize": str(tile_size),
+            "Format": fmt,
+            "NextItemId": str(len(files)),
+            "ServerFormat": "Default",
+            "xmlns": "http://schemas.microsoft.com/deepzoom/2008",
+        },
+    )
+    collection_el.append(items_el)
+
+    xml_path = out_dir / "collection.xml"
+    tree = ET.ElementTree(collection_el)
+    tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+
+    typer.echo(f"📂 Collection saved -> {xml_path}")
+
+
+@app.command()
+def make_single_dzi(
+    canvases_dir: Path = typer.Argument(..., help="Directory of combined canvases"),
+    out_dir: Path = typer.Argument(..., help="Output dir for single DZI"),
+    tile_size: int = typer.Option(256, help="Tile size (default 256)"),
+    overlap: int = typer.Option(1, help="Tile overlap (default 1)"),
+    fmt: str = typer.Option("jpg", help="Tile format (jpg or png)"),
+    max_height: int = typer.Option(50000, help="Max height before creating new canvas"),
+):
+    """
+    Combine all canvases into one massive image and tile into a single DeepZoom (.dzi + tiles).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    files = sorted([f for f in canvases_dir.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png")])
+    if not files:
+        typer.echo("❌ No canvas files found")
+        return
+    
+    typer.echo(f"Found {len(files)} canvases to combine")
+    
+    # First pass to get dimensions
+    typer.echo("📏 Measuring canvases...")
+    canvas_w = 0
+    total_height = 0
+    
+    for f in files:
+        with Image.open(f) as img:
+            canvas_w = max(canvas_w, img.width)
+            total_height += img.height
+    
+    typer.echo(f"Combined dimensions will be: {canvas_w}x{total_height}")
+    
+    # Create the massive combined image
+    typer.echo("🖼️  Creating massive combined image...")
+    combined = Image.new("RGB", (canvas_w, total_height), (255, 255, 255))
+    
+    current_y = 0
+    for f in files:
+        typer.echo(f"  Adding {f.name}...")
+        with Image.open(f) as img:
+            combined.paste(img, (0, current_y))
+            current_y += img.height
+    
+    typer.echo("🔧 Tiling massive image into DeepZoom format...")
+    
+    # Calculate levels for the massive image
+    w, h = combined.size
+    max_dim = max(w, h)
+    levels = int(math.ceil(math.log(max_dim, 2))) + 1
+    
+    # Create DZI file
+    dzi_path = out_dir / "combined.dzi"
+    dzi_xml = f"""<Image TileSize="{tile_size}" Overlap="{overlap}" Format="{fmt}"
+    xmlns="http://schemas.microsoft.com/deepzoom/2008">
+  <Size Width="{w}" Height="{h}" />
+</Image>"""
+    dzi_path.write_text(dzi_xml)
+    
+    typer.echo(f"📄 Created DZI metadata: {dzi_path}")
+    typer.echo(f"🎯 Will create {levels} zoom levels")
+    
+    # Generate tiles for each level
+    for level in range(levels):
+        scale = 2 ** (levels - level - 1)
+        level_w = int(math.ceil(w / scale))
+        level_h = int(math.ceil(h / scale))
+        
+        typer.echo(f"⚙️  Processing level {level}: {level_w}x{level_h}")
+        level_img = combined.resize((level_w, level_h), Image.LANCZOS)
+        
+        cols = math.ceil(level_w / tile_size)
+        rows = math.ceil(level_h / tile_size)
+        level_dir = out_dir / "combined" / str(level)
+        level_dir.mkdir(parents=True, exist_ok=True)
+        
+        tile_count = 0
+        total_tiles = cols * rows
+        
+        for col in range(cols):
+            for row in range(rows):
+                box = (
+                    col * tile_size,
+                    row * tile_size,
+                    min((col + 1) * tile_size, level_w),
+                    min((row + 1) * tile_size, level_h),
+                )
+                tile = level_img.crop(box)
+                tile.save(level_dir / f"{col}_{row}.{fmt}", quality=90)
+                tile_count += 1
+                
+                # Progress indicator for large levels
+                if tile_count % 100 == 0 or tile_count == total_tiles:
+                    typer.echo(f"    Created {tile_count}/{total_tiles} tiles")
+    
+    typer.echo(f"✅ Single DZI created: {dzi_path}")
+    typer.echo(f"📁 Tiles saved in: {out_dir / 'combined'}")
+    typer.echo(f"🎉 Final image size: {w}x{h} pixels")
 
 
 if __name__ == "__main__":
