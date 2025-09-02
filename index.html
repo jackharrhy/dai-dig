@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.0/openseadragon.min.js"></script>
+    <style>
+#openseadragon1 { width: 100vw; height: 100vh; }
+    </style>
+  </head>
+  <body>
+    <div id="openseadragon1"></div>
+    <script>
+      OpenSeadragon({
+        id: "openseadragon1",
+        prefixUrl: "https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.0/images/",
+        showNavigator: true,
+        tileSources: "http://localhost:8000/timeline.dzi",
+      });
+    </script>
+  </body>
+</html>
+
