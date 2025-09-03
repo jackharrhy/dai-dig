@@ -10,6 +10,7 @@ import re
 import os
 import xml.etree.ElementTree as ET
 import math
+import gc
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -752,7 +753,7 @@ def make_year_strip(year_dir: Path, out_dir: Path) -> Path | None:
                 with Image.open(img_path) as img:
                     scale = max_h / img.height
                     scaled_img = img.resize(
-                        (int(img.width * scale), max_h), Image.LANCZOS
+                        (int(img.width * scale), max_h), Image.Resampling.LANCZOS
                     )
                     yield scaled_img.copy()
             except Exception:
@@ -827,7 +828,7 @@ def tile_image(img_path: Path, out_dir: Path, tile_size=256, overlap=1, fmt="jpg
             scale = 2 ** (levels - level - 1)
             level_w = int(math.ceil(w / scale))
             level_h = int(math.ceil(h / scale))
-            level_img = img.resize((level_w, level_h), Image.LANCZOS)
+            level_img = img.resize((level_w, level_h), Image.Resampling.LANCZOS)
 
             cols = math.ceil(level_w / tile_size)
             rows = math.ceil(level_h / tile_size)
@@ -848,6 +849,127 @@ def tile_image(img_path: Path, out_dir: Path, tile_size=256, overlap=1, fmt="jpg
     return w, h, dzi_path
 
 
+class StripPosition:
+    """Helper class to track strip positions and enable efficient lookups."""
+
+    def __init__(
+        self, file_path: Path, y_start: int, y_end: int, width: int, height: int
+    ):
+        self.file_path = file_path
+        self.y_start = y_start
+        self.y_end = y_end
+        self.width = width
+        self.height = height
+
+
+def build_strip_positions(files: list[Path]) -> tuple[list[StripPosition], int, int]:
+    """Build strip position mapping without loading images into memory."""
+    typer.echo("📏 Building strip position map...")
+
+    strip_positions = []
+    canvas_w = 0
+    current_y = 0
+
+    for i, f in enumerate(files):
+        with Image.open(f) as img:
+            w, h = img.size
+            canvas_w = max(canvas_w, w)
+
+            strip_pos = StripPosition(f, current_y, current_y + h, w, h)
+            strip_positions.append(strip_pos)
+            current_y += h
+
+            typer.echo(
+                f"  Strip {i + 1}/{len(files)}: {f.name} - {w}x{h}px at y={strip_pos.y_start}-{strip_pos.y_end}"
+            )
+
+    total_height = current_y
+    typer.echo(f"📐 Virtual combined dimensions: {canvas_w}x{total_height}px")
+
+    return strip_positions, canvas_w, total_height
+
+
+def get_strips_for_tile(
+    strip_positions: list[StripPosition], y_start: int, y_end: int
+) -> list[StripPosition]:
+    """Find which strips overlap with a given Y range."""
+    overlapping = []
+    for strip in strip_positions:
+        # Check if strip overlaps with tile Y range
+        if strip.y_end > y_start and strip.y_start < y_end:
+            overlapping.append(strip)
+    return overlapping
+
+
+def create_tile_from_strips(
+    strip_positions: list[StripPosition],
+    tile_y_start: int,
+    tile_y_end: int,
+    tile_x_start: int,
+    tile_x_end: int,
+    canvas_w: int,
+    tile_size: int,
+    scale: float,
+) -> Image.Image:
+    """Generate a single tile by loading only the required strips."""
+
+    # Calculate actual tile dimensions
+    tile_w = min(tile_size, tile_x_end - tile_x_start)
+    tile_h = min(tile_size, tile_y_end - tile_y_start)
+
+    # Create tile canvas
+    tile = Image.new("RGB", (tile_w, tile_h), (255, 255, 255))
+
+    # Find strips that overlap with this tile
+    relevant_strips = get_strips_for_tile(strip_positions, tile_y_start, tile_y_end)
+
+    for strip in relevant_strips:
+        # Calculate intersection between tile and strip
+        strip_y_in_tile_start = max(0, strip.y_start - tile_y_start)
+        strip_y_in_tile_end = min(tile_h, strip.y_end - tile_y_start)
+
+        if strip_y_in_tile_start >= strip_y_in_tile_end:
+            continue  # No intersection
+
+        # Load and scale the strip
+        with Image.open(strip.file_path) as strip_img:
+            # Scale strip to the current level
+            scaled_w = int(strip_img.width / scale)
+            scaled_h = int(strip_img.height / scale)
+
+            if scaled_w <= 0 or scaled_h <= 0:
+                continue
+
+            scaled_strip = strip_img.resize(
+                (scaled_w, scaled_h), Image.Resampling.LANCZOS
+            )
+
+            # Calculate which part of the scaled strip we need
+            scaled_y_start = int((tile_y_start - strip.y_start) / scale)
+            scaled_y_end = int((tile_y_end - strip.y_start) / scale)
+            scaled_x_start = int(tile_x_start / scale)
+            scaled_x_end = int(tile_x_end / scale)
+
+            # Clamp to strip boundaries
+            scaled_y_start = max(0, scaled_y_start)
+            scaled_y_end = min(scaled_h, scaled_y_end)
+            scaled_x_start = max(0, scaled_x_start)
+            scaled_x_end = min(scaled_w, scaled_x_end)
+
+            if scaled_y_start >= scaled_y_end or scaled_x_start >= scaled_x_end:
+                continue
+
+            # Crop the relevant portion
+            crop_box = (scaled_x_start, scaled_y_start, scaled_x_end, scaled_y_end)
+            cropped_strip = scaled_strip.crop(crop_box)
+
+            # Paste into tile at the correct position
+            paste_y = strip_y_in_tile_start
+            tile.paste(cropped_strip, (0, paste_y))
+
+    return tile
+
+
 @app.command()
 def make_single_dzi(
     strips_dir: Path = typer.Argument(
@@ -860,7 +982,7 @@ def make_single_dzi(
 ):
     """
     Combine all year strips into one massive image and tile into a single DeepZoom (.dzi + tiles).
-    Now works directly on strips (year strips are the new canvases).
+    Uses streaming approach to avoid loading the entire combined image into memory.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -880,98 +1002,90 @@ def make_single_dzi(
 
     typer.echo(f"✅ Found {len(files)} year strips to combine")
 
-    # First pass to get dimensions using memory-efficient approach
-    typer.echo("📏 Measuring strips...")
-    canvas_w = 0
-    total_height = 0
+    # Build strip position mapping (memory efficient)
+    strip_positions, canvas_w, total_height = build_strip_positions(files)
 
-    for i, f in enumerate(files):
-        with Image.open(f) as img:
-            canvas_w = max(canvas_w, img.width)
-            total_height += img.height
-            typer.echo(
-                f"  Strip {i + 1}/{len(files)}: {f.name} - {img.width}x{img.height}px"
-            )
-
-    typer.echo(f"📐 Combined dimensions will be: {canvas_w}x{total_height}px")
-
-    # Create the massive combined image
-    typer.echo("🖼️  Creating massive combined image...")
-    combined = Image.new("RGB", (canvas_w, total_height), (255, 255, 255))
-
-    current_y = 0
-    for i, f in enumerate(files):
-        typer.echo(f"  📋 Adding strip {i + 1}/{len(files)}: {f.name} at y={current_y}")
-        with Image.open(f) as img:
-            combined.paste(img, (0, current_y))
-            current_y += img.height
-
-    typer.echo("🔧 Tiling massive image into DeepZoom format...")
-
-    # Calculate levels for the massive image
-    w, h = combined.size
+    # Calculate zoom levels
+    w, h = canvas_w, total_height
     max_dim = max(w, h)
     max_levels = int(math.ceil(math.log(max_dim, 2))) + 1
 
     # Skip tiny zoom levels - start when smallest dimension is at least 512px
     min_useful_dim = 512
     min_useful_level = max(0, max_levels - int(math.ceil(math.log(min_useful_dim, 2))))
-    levels_to_create = max_levels - min_useful_level
 
     typer.echo(f"📊 Image analysis:")
-    typer.echo(f"    • Full size: {w}x{h}px")
+    typer.echo(f"    • Virtual combined size: {w}x{h}px")
     typer.echo(f"    • Total possible levels: {max_levels}")
     typer.echo(f"    • Skipping tiny levels 0-{min_useful_level - 1}")
     typer.echo(f"    • Will create levels {min_useful_level}-{max_levels - 1}")
 
-    # Create DZI file (always reports the full level range)
+    # Create DZI file
     dzi_path = out_dir / "timeline.dzi"
     dzi_xml = f"""<Image TileSize="{tile_size}" Overlap="{overlap}" Format="{fmt}"
     xmlns="http://schemas.microsoft.com/deepzoom/2008">
   <Size Width="{w}" Height="{h}" />
 </Image>"""
     dzi_path.write_text(dzi_xml)
-
     typer.echo(f"📄 Created DZI metadata: {dzi_path}")
-    typer.echo(f"🎯 Creating {levels_to_create} useful zoom levels...")
 
-    # Generate tiles for useful levels only
+    # Generate tiles level by level using streaming approach
+    typer.echo("🔧 Generating tiles using streaming approach...")
+
     for level in range(min_useful_level, max_levels):
         scale = 2 ** (max_levels - level - 1)
         level_w = int(math.ceil(w / scale))
         level_h = int(math.ceil(h / scale))
 
-        typer.echo(f"⚙️  Processing level {level}: {level_w}x{level_h}")
-        level_img = combined.resize((level_w, level_h), Image.LANCZOS)
+        typer.echo(
+            f"⚙️  Processing level {level}: {level_w}x{level_h} (scale: 1/{scale})"
+        )
 
         cols = math.ceil(level_w / tile_size)
         rows = math.ceil(level_h / tile_size)
         level_dir = out_dir / "timeline" / str(level)
         level_dir.mkdir(parents=True, exist_ok=True)
 
-        tile_count = 0
         total_tiles = cols * rows
+        tile_count = 0
 
-        for col in range(cols):
-            for row in range(rows):
-                box = (
-                    col * tile_size,
-                    row * tile_size,
-                    min((col + 1) * tile_size, level_w),
-                    min((row + 1) * tile_size, level_h),
+        for row in range(rows):
+            for col in range(cols):
+                # Calculate tile boundaries in full-resolution coordinates
+                tile_x_start = col * tile_size * scale
+                tile_x_end = min((col + 1) * tile_size * scale, w)
+                tile_y_start = row * tile_size * scale
+                tile_y_end = min((row + 1) * tile_size * scale, h)
+
+                # Generate tile from relevant strips
+                tile = create_tile_from_strips(
+                    strip_positions,
+                    tile_y_start,
+                    tile_y_end,
+                    tile_x_start,
+                    tile_x_end,
+                    canvas_w,
+                    tile_size,
+                    scale,
                 )
-                tile = level_img.crop(box)
+
+                # Save tile
                 tile.save(level_dir / f"{col}_{row}.{fmt}", quality=90)
                 tile_count += 1
 
-                # Progress indicator for large levels
-                if tile_count % 100 == 0 or tile_count == total_tiles:
-                    typer.echo(f"    Created {tile_count}/{total_tiles} tiles")
+                # Progress indicator and memory cleanup
+                if tile_count % 50 == 0 or tile_count == total_tiles:
+                    typer.echo(
+                        f"    Level {level}: Created {tile_count}/{total_tiles} tiles"
+                    )
+                    # Force garbage collection every 50 tiles to keep memory usage down
+                    gc.collect()
 
     typer.echo(f"✅ Timeline DZI created: {dzi_path}")
     typer.echo(f"📁 Tiles saved in: {out_dir / 'timeline'}")
     typer.echo(f"🎉 Final timeline size: {w}x{h} pixels")
     typer.echo(f"📰 Timeline contains {len(files)} years of newspapers")
+    typer.echo(f"💾 Memory-efficient streaming approach used - no OOM issues!")
 
 
 if __name__ == "__main__":
