@@ -11,6 +11,8 @@ import os
 import xml.etree.ElementTree as ET
 import math
 import gc
+from functools import lru_cache
+from typing import Dict
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -862,6 +864,79 @@ class StripPosition:
         self.height = height
 
 
+class StripCache:
+    """Smart cache for strips at different zoom levels to balance speed and memory usage."""
+
+    def __init__(self, max_memory_gb: float = 20.0):
+        self.cache: Dict[str, Image.Image] = {}
+        self.max_memory_bytes = int(max_memory_gb * 1024 * 1024 * 1024)
+        self.current_memory_usage = 0
+        self.current_scale = None
+
+    def _estimate_image_memory(self, img: Image.Image) -> int:
+        """Estimate memory usage of a PIL Image in bytes."""
+        # Rough estimate: width * height * channels * bytes_per_channel
+        return img.width * img.height * (4 if img.mode == "RGBA" else 3)
+
+    def _make_cache_key(self, file_path: Path, scale: float) -> str:
+        """Create cache key for strip at given scale."""
+        return f"{file_path.name}@{scale}"
+
+    def clear_cache(self):
+        """Clear all cached strips to free memory."""
+        self.cache.clear()
+        self.current_memory_usage = 0
+        self.current_scale = None
+        gc.collect()
+
+    def get_scaled_strip(self, strip_pos: StripPosition, scale: float) -> Image.Image:
+        """Get strip scaled to the specified level, using cache if available."""
+        cache_key = self._make_cache_key(strip_pos.file_path, scale)
+
+        # If scale changed significantly, clear cache to avoid memory bloat
+        if (
+            self.current_scale is not None
+            and abs(self.current_scale - scale) > scale * 0.1
+        ):
+            typer.echo(
+                f"    🔄 Scale changed from {self.current_scale:.3f} to {scale:.3f}, clearing cache..."
+            )
+            self.clear_cache()
+
+        self.current_scale = scale
+
+        # Return from cache if available
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        # Load and scale the strip
+        with Image.open(strip_pos.file_path) as strip_img:
+            scaled_w = max(1, int(strip_img.width / scale))
+            scaled_h = max(1, int(strip_img.height / scale))
+            scaled_strip = strip_img.resize(
+                (scaled_w, scaled_h), Image.Resampling.LANCZOS
+            )
+
+            # Make a copy since we're closing the original
+            cached_strip = scaled_strip.copy()
+
+            # Estimate memory usage
+            estimated_memory = self._estimate_image_memory(cached_strip)
+
+            # If adding this would exceed memory limit, don't cache it
+            if self.current_memory_usage + estimated_memory > self.max_memory_bytes:
+                typer.echo(
+                    f"    ⚠️ Cache full ({self.current_memory_usage / (1024 * 1024 * 1024):.1f}GB), not caching {strip_pos.file_path.name}"
+                )
+                return cached_strip
+
+            # Cache the scaled strip
+            self.cache[cache_key] = cached_strip
+            self.current_memory_usage += estimated_memory
+
+            return cached_strip
+
+
 def build_strip_positions(files: list[Path]) -> tuple[list[StripPosition], int, int]:
     """Build strip position mapping without loading images into memory."""
     typer.echo("📏 Building strip position map...")
@@ -901,7 +976,7 @@ def get_strips_for_tile(
     return overlapping
 
 
-def create_tile_from_strips(
+def create_tile_from_strips_cached(
     strip_positions: list[StripPosition],
     tile_y_start: int,
     tile_y_end: int,
@@ -910,8 +985,9 @@ def create_tile_from_strips(
     canvas_w: int,
     tile_size: int,
     scale: float,
+    cache: StripCache,
 ) -> Image.Image:
-    """Generate a single tile by loading only the required strips."""
+    """Generate a single tile using cached scaled strips for better performance."""
 
     # Calculate actual tile dimensions
     tile_w = min(tile_size, tile_x_end - tile_x_start)
@@ -931,41 +1007,31 @@ def create_tile_from_strips(
         if strip_y_in_tile_start >= strip_y_in_tile_end:
             continue  # No intersection
 
-        # Load and scale the strip
-        with Image.open(strip.file_path) as strip_img:
-            # Scale strip to the current level
-            scaled_w = int(strip_img.width / scale)
-            scaled_h = int(strip_img.height / scale)
+        # Get cached scaled strip (much faster than loading from disk each time)
+        scaled_strip = cache.get_scaled_strip(strip, scale)
 
-            if scaled_w <= 0 or scaled_h <= 0:
-                continue
+        # Calculate which part of the scaled strip we need
+        scaled_y_start = int((tile_y_start - strip.y_start) / scale)
+        scaled_y_end = int((tile_y_end - strip.y_start) / scale)
+        scaled_x_start = int(tile_x_start / scale)
+        scaled_x_end = int(tile_x_end / scale)
 
-            scaled_strip = strip_img.resize(
-                (scaled_w, scaled_h), Image.Resampling.LANCZOS
-            )
+        # Clamp to strip boundaries
+        scaled_y_start = max(0, scaled_y_start)
+        scaled_y_end = min(scaled_strip.height, scaled_y_end)
+        scaled_x_start = max(0, scaled_x_start)
+        scaled_x_end = min(scaled_strip.width, scaled_x_end)
 
-            # Calculate which part of the scaled strip we need
-            scaled_y_start = int((tile_y_start - strip.y_start) / scale)
-            scaled_y_end = int((tile_y_end - strip.y_start) / scale)
-            scaled_x_start = int(tile_x_start / scale)
-            scaled_x_end = int(tile_x_end / scale)
+        if scaled_y_start >= scaled_y_end or scaled_x_start >= scaled_x_end:
+            continue
 
-            # Clamp to strip boundaries
-            scaled_y_start = max(0, scaled_y_start)
-            scaled_y_end = min(scaled_h, scaled_y_end)
-            scaled_x_start = max(0, scaled_x_start)
-            scaled_x_end = min(scaled_w, scaled_x_end)
+        # Crop the relevant portion
+        crop_box = (scaled_x_start, scaled_y_start, scaled_x_end, scaled_y_end)
+        cropped_strip = scaled_strip.crop(crop_box)
 
-            if scaled_y_start >= scaled_y_end or scaled_x_start >= scaled_x_end:
-                continue
-
-            # Crop the relevant portion
-            crop_box = (scaled_x_start, scaled_y_start, scaled_x_end, scaled_y_end)
-            cropped_strip = scaled_strip.crop(crop_box)
-
-            # Paste into tile at the correct position
-            paste_y = strip_y_in_tile_start
-            tile.paste(cropped_strip, (0, paste_y))
+        # Paste into tile at the correct position
+        paste_y = strip_y_in_tile_start
+        tile.paste(cropped_strip, (0, paste_y))
 
     return tile
 
@@ -982,7 +1048,8 @@ def make_single_dzi(
 ):
     """
     Combine all year strips into one massive image and tile into a single DeepZoom (.dzi + tiles).
-    Uses streaming approach to avoid loading the entire combined image into memory.
+    Uses hybrid caching approach to balance speed and memory usage - much faster than pure streaming
+    while avoiding OOM issues.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1029,8 +1096,14 @@ def make_single_dzi(
     dzi_path.write_text(dzi_xml)
     typer.echo(f"📄 Created DZI metadata: {dzi_path}")
 
-    # Generate tiles level by level using streaming approach
-    typer.echo("🔧 Generating tiles using streaming approach...")
+    # Generate tiles level by level using hybrid caching approach
+    typer.echo("🔧 Generating tiles using hybrid caching approach...")
+
+    # Initialize strip cache with reasonable memory limit (adjust based on available RAM)
+    cache = StripCache(max_memory_gb=20.0)  # Use up to 20GB for caching
+    typer.echo(
+        f"💾 Strip cache initialized with {cache.max_memory_bytes / (1024**3):.1f}GB limit"
+    )
 
     for level in range(min_useful_level, max_levels):
         scale = 2 ** (max_levels - level - 1)
@@ -1057,8 +1130,8 @@ def make_single_dzi(
                 tile_y_start = row * tile_size * scale
                 tile_y_end = min((row + 1) * tile_size * scale, h)
 
-                # Generate tile from relevant strips
-                tile = create_tile_from_strips(
+                # Generate tile from relevant strips using cache
+                tile = create_tile_from_strips_cached(
                     strip_positions,
                     tile_y_start,
                     tile_y_end,
@@ -1067,25 +1140,37 @@ def make_single_dzi(
                     canvas_w,
                     tile_size,
                     scale,
+                    cache,
                 )
 
                 # Save tile
                 tile.save(level_dir / f"{col}_{row}.{fmt}", quality=90)
                 tile_count += 1
 
-                # Progress indicator and memory cleanup
-                if tile_count % 50 == 0 or tile_count == total_tiles:
-                    typer.echo(
-                        f"    Level {level}: Created {tile_count}/{total_tiles} tiles"
+                # Progress indicator with cache stats
+                if tile_count % 25 == 0 or tile_count == total_tiles:
+                    cache_usage_gb = cache.current_memory_usage / (1024**3)
+                    cache_hit_rate = (
+                        len(cache.cache) / len(strip_positions) * 100
+                        if strip_positions
+                        else 0
                     )
-                    # Force garbage collection every 50 tiles to keep memory usage down
+                    typer.echo(
+                        f"    Level {level}: {tile_count}/{total_tiles} tiles | Cache: {cache_usage_gb:.1f}GB ({cache_hit_rate:.0f}% strips cached)"
+                    )
+
+                # Periodic garbage collection, but less frequent since we're using cache
+                if tile_count % 100 == 0:
                     gc.collect()
+
+    # Final cleanup
+    cache.clear_cache()
 
     typer.echo(f"✅ Timeline DZI created: {dzi_path}")
     typer.echo(f"📁 Tiles saved in: {out_dir / 'timeline'}")
     typer.echo(f"🎉 Final timeline size: {w}x{h} pixels")
     typer.echo(f"📰 Timeline contains {len(files)} years of newspapers")
-    typer.echo(f"💾 Memory-efficient streaming approach used - no OOM issues!")
+    typer.echo(f"🚀 Hybrid caching approach used - balanced speed and memory usage!")
 
 
 if __name__ == "__main__":
